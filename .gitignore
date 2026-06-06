@@ -1,0 +1,19 @@
+# Python bytecode caches.
+__pycache__/
+*.pyc
+*.pyo
+
+# Local virtual envs.
+venv/
+.venv/
+env/
+
+# Editor / OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Server-side cache (rendered pages live here at runtime — never commit).
+/tmp/pdf2img-cache/
+pdf2img-cache/

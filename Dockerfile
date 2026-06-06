@@ -1,12 +1,20 @@
 # Dockerfile for pdf2img — Render / Fly.io / Hugging Face / any container host.
-# Built image is ~120 MB (python:3.11-slim + poppler-utils + Flask).
+# Built image is ~150 MB (python:3.11-slim + poppler-utils + libcairo2 +
+# Flask + Pillow + CairoSVG).
 
 FROM python:3.11-slim
 
-# poppler-utils gives us pdftoppm + pdfinfo, the only system deps we need.
+# System deps:
+#   poppler-utils     — pdftoppm + pdfinfo for the /pdf2img endpoint
+#   libcairo2         — runtime for CairoSVG (used by /img2png to render
+#                       .svg files server-side, which works around the
+#                       gradientTransform / clipPath limits of the ESP32's
+#                       NanoSVG decoder)
 # Combine apt update / install / clean in ONE layer so the image stays small.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends poppler-utils \
+ && apt-get install -y --no-install-recommends \
+      poppler-utils \
+      libcairo2 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

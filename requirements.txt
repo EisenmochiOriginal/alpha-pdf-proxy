@@ -1,3 +1,8 @@
 Flask==3.0.3
 requests==2.32.3
 gunicorn==22.0.0
+# Image conversion + downsize. Pillow handles WebP / JPG decode and the
+# LANCZOS resize in downsize_png(); CairoSVG renders SVG via libcairo2
+# (installed in the Dockerfile).
+Pillow==10.4.0
+cairosvg==2.7.1

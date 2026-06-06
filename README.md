@@ -1,10 +1,25 @@
-# pdf2img — PDF→PNG proxy for the ALPHA ESP32 browser
+# pdf2img — PDF / WebP / SVG → PNG proxy for the ALPHA ESP32 browser
 
-The ESP32 can't render PDFs itself (no native PDF library fits the chip).
-This proxy receives a PDF URL, downloads it, renders the requested page to
-PNG with `pdftoppm` (poppler-utils), and returns the PNG so the ESP32 can
-display it via its existing PNG decoder. Server-side cache so the same
-PDF isn't re-rendered on every request.
+The ESP32 can't render PDFs itself (no native PDF library fits the chip), it
+has no native WebP decoder, and its NanoSVG decoder can't handle
+`gradientTransform` or `clipPath`. This proxy takes a URL pointing at any
+of those formats, converts it server-side, and returns a PNG the ESP32 can
+display via its existing decoder.
+
+- **`/pdf2img`** — downloads a PDF, renders page N via `pdftoppm` (poppler-utils).
+  Returns PNG + `X-Pdf-Pages: M`.
+- **`/img2png`** — downloads a WebP / SVG / JPG / PNG and converts it to a PNG.
+  Pillow handles WebP / JPG decode; CairoSVG renders SVG via libcairo2.
+  Returns PNG + `X-Original-Format: <fmt>`.
+
+Both endpoints **downsize the output** if it would bust the ESP32's 4 MB
+PSRAM sprite cap: anything larger than 1200 px on the long edge or 2 MB
+total is iteratively scaled (LANCZOS) until it fits. The shrunk version is
+what gets cached, so subsequent requests for the same URL are instant.
+
+Server-side cache: each PDF and each converted image is downloaded ONCE
+(keyed by SHA1 of the URL); each rendered page / converted PNG is generated
+ONCE.
 
 ## Where do I run this?
 
@@ -23,7 +38,9 @@ a wide margin.
 On any Linux box, macOS, WSL, or Raspberry Pi:
 
 ```bash
-sudo apt install poppler-utils python3-flask python3-requests   # Debian / Pi OS
+# Debian / Ubuntu / Raspberry Pi OS:
+sudo apt install poppler-utils libcairo2 python3-flask python3-requests \
+                 python3-pil python3-cairosvg
 python3 pdf2img.py
 # Listening on 0.0.0.0:8080
 ```
@@ -35,8 +52,19 @@ Then in `browser.cpp` set
 Test it:
 
 ```bash
+# PDF endpoint
 curl -o page1.png "http://localhost:8080/pdf2img?url=https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf&page=1"
 file page1.png   # → PNG image data
+
+# WebP endpoint
+curl -o pic.png "http://localhost:8080/img2png?url=https://www.gstatic.com/webp/gallery/1.webp"
+file pic.png     # → PNG image data
+curl -sI "http://localhost:8080/img2png?url=https://www.gstatic.com/webp/gallery/1.webp" | grep X-Original
+# → X-Original-Format: webp
+
+# SVG endpoint
+curl -o tux.png "http://localhost:8080/img2png?url=https://upload.wikimedia.org/wikipedia/commons/3/35/Tux.svg"
+file tux.png     # → PNG image data
 ```
 
 ## Exposing it to the internet — Cloudflare Tunnel (free, no port forwarding)
@@ -97,12 +125,22 @@ Environment variables read by `pdf2img.py`:
   want the cache wiped on reboot.
 - `PDF2IMG_DPI` — render DPI. Default 100. Higher = sharper PNG = bigger
   download. The ESP32 screen is 320×480 so anything past ~150 is wasted.
+- `PDF2IMG_MAX_DIM` — long-edge cap (px) for ALL output PNGs (PDF + img).
+  Default 1200. Bumping past ~1400 risks busting the ESP32's 4 MB PSRAM
+  sprite cap.
+- `PDF2IMG_MAX_BYTES` — file-size cap for output PNGs. Default 2 MB.
+  Iterative LANCZOS shrink until both dim and bytes caps fit.
+- `PDF2IMG_SVG_WIDTH` — render width passed to CairoSVG for size-less
+  SVGs (those using viewBox only with no intrinsic width). Defaults to
+  `PDF2IMG_MAX_DIM`.
 - `PORT` — TCP port. Default 8080.
 
 ## Endpoints
 
-- `GET /pdf2img?url=<URL>&page=N` — main endpoint. Returns image/png plus
+- `GET /pdf2img?url=<URL>&page=N` — PDF page → PNG. Returns image/png plus
   `X-Pdf-Pages: M` header with the total page count.
+- `GET /img2png?url=<URL>` — WebP / SVG / JPG / PNG → PNG. Returns image/png
+  plus `X-Original-Format: <fmt>` so the ESP32 can log what got converted.
 - `GET /health` — for the tunnel / load balancer to ping. Returns 200 ok.
 
 ## ESP32-side cache
