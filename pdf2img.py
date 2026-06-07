@@ -439,18 +439,41 @@ _KEEP_TAGS = {
     'ol', 'li', 'blockquote', 'img', 'span', 'b', 'strong', 'i', 'em',
     'table', 'tr', 'td', 'th', 'body', 'html',
 }
-# class / id substrings that mark non-content chrome (ads, nav, cookie bars).
-_JUNK_CLASS = re.compile(
-    r'(?:^|[\s_-])(?:ad|ads|advert|sponsor|banner|promo|msg|about-ads|ddg|'
-    r'result[-_]url|cookie|consent|newsletter|popup|modal|sidebar|menu|'
-    r'share|social|comment|related|recommend|footer|header|nav)\b', re.I)
+# Junk markers, matched per TOKEN SEGMENT (a class/id split on space then on
+# '-'/'_'), NOT as a loose substring of the whole class string. Substring
+# matching was catastrophic: e.g. <html class="...language-in-header-enabled">
+# matched "header" and decomposed the ENTIRE document. Segment matching only
+# fires on an exact delimited segment, so feature-flag classes are safe.
+_JUNK_WORDS = frozenset((
+    'ad', 'ads', 'adbox', 'advert', 'advertisement', 'adslot', 'adunit',
+    'sponsor', 'sponsored', 'banner', 'popup', 'modal', 'overlay', 'lightbox',
+    'cookie', 'consent', 'gdpr', 'newsletter', 'subscribe', 'signup',
+    'paywall', 'social', 'share', 'sharing', 'sharedaddy', 'related',
+    'recommended', 'comments', 'disqus', 'sidebar', 'breadcrumb', 'promo',
+    'masthead',
+))
+# Never decompose these — they are (or wrap) the whole document / main content.
+_NEVER_KILL = frozenset(('html', 'body', 'main', 'article', '[document]'))
 
 
-def _classes_str(tag):
-    cls = tag.get('class', [])
-    if isinstance(cls, list):
-        cls = ' '.join(cls)
-    return (cls or '') + ' ' + (tag.get('id', '') or '')
+def _is_junk(tag):
+    if getattr(tag, 'attrs', None) is None:
+        return False
+    if tag.name in _NEVER_KILL:
+        return False
+    tokens = []
+    cls = tag.get('class') or []
+    if isinstance(cls, str):
+        cls = cls.split()
+    tokens.extend(cls)
+    idv = tag.get('id')
+    if idv:
+        tokens.append(idv)
+    for tok in tokens:
+        for seg in re.split(r'[-_]+', tok.lower()):
+            if seg in _JUNK_WORDS:
+                return True
+    return False
 
 
 def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
@@ -464,15 +487,22 @@ def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
         t.decompose()
     for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
         c.extract()
-    # Drop ad / nav-ish blocks by class/id substring.
-    for t in soup.find_all(True):
-        if _JUNK_CLASS.search(_classes_str(t)):
+    # Drop ad / cookie / chrome blocks by class/id segment. COLLECT first,
+    # then decompose: decomposing a tag sets its descendants' `attrs` to None,
+    # so iterating find_all() and decomposing in the same pass would call
+    # .get() on an already-decomposed descendant (AttributeError). Gather the
+    # matches while everything is attached, then decompose those still in tree.
+    junk = [t for t in soup.find_all(True) if _is_junk(t)]
+    for t in junk:
+        if t.parent is not None:        # not already removed via an ancestor
             t.decompose()
 
     body = soup.body or soup
 
     # Clean attributes, rewrite links/images, unwrap unknown tags.
     for t in list(body.find_all(True)):
+        if getattr(t, 'attrs', None) is None:   # detached by an earlier pass
+            continue
         name = (t.name or '').lower()
         if name == 'a':
             href = t.get('href')
