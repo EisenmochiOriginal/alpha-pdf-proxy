@@ -184,6 +184,56 @@ def _detect_image_format(url: str, raw: bytes) -> str:
     return 'unknown'
 
 
+def _inline_svg_entities(raw: bytes) -> bytes:
+    # cairosvg (via defusedxml) raises EntitiesForbidden on SVGs that declare
+    # custom <!ENTITY> values — which lots of real SVGs do (e.g. Wikipedia
+    # logos use internal style entities like <!ENTITY st0 "fill:#fff">
+    # referenced as &st0;). That was turning "open this image" into a 500.
+    # Resolve those INTERNAL entities ourselves and drop the DOCTYPE so the
+    # file parses. We deliberately do NOT use cairosvg's unsafe=True, which
+    # would also resolve EXTERNAL entities -> XXE/SSRF (e.g. file:// or cloud-
+    # metadata URLs). The regex only matches name + quoted literal value, so
+    # SYSTEM/PUBLIC external entities are left alone (and thus never fetched).
+    try:
+        text = raw.decode('utf-8', 'replace')
+    except Exception:
+        return raw
+    if '<!ENTITY' not in text:
+        return raw
+    ents = {}
+    for m in re.finditer(r'<!ENTITY\s+(\w+)\s+(["\'])(.*?)\2\s*>', text, re.DOTALL):
+        ents[m.group(1)] = m.group(3)
+    if not ents:
+        return raw
+    for _ in range(4):                       # a few passes for nested refs
+        changed = False
+        for name, val in ents.items():
+            ref = '&' + name + ';'
+            if ref in text:
+                text = text.replace(ref, val)
+                changed = True
+        if not changed:
+            break
+    # Strip the internal DTD subset (and any plain DOCTYPE) entirely.
+    text = re.sub(r'<!DOCTYPE.*?\]\s*>', '', text, count=1, flags=re.DOTALL)
+    text = re.sub(r'<!DOCTYPE[^>]*>', '', text)
+    return text.encode('utf-8')
+
+
+def _svg_to_png(raw: bytes) -> bytes:
+    # Inline entities first (above), then render at the SVG's intrinsic size,
+    # falling back to an explicit width if that fails or comes out tiny — so
+    # a viewBox favicon stays ~100px while a size-less SVG still renders.
+    raw = _inline_svg_entities(raw)
+    try:
+        png = cairosvg.svg2png(bytestring=raw)
+        if max(Image.open(io.BytesIO(png)).size) >= 16:
+            return png
+    except Exception:
+        pass
+    return cairosvg.svg2png(bytestring=raw, output_width=SVG_RENDER_WIDTH)
+
+
 @app.route('/pdf2img')
 def pdf2img():
     pdf_url = request.args.get('url')
@@ -317,23 +367,13 @@ def img2png():
     # Convert to a PNG byte stream.
     try:
         if fmt == 'svg':
-            # Respect the SVG's OWN size (width/height, or the viewBox).
-            # CairoSVG honours the intrinsic size when no output_width is
-            # given — a viewBox="0 0 100 100" favicon renders ~100px, a
-            # viewBox="0 0 140 22" wordmark renders 140x22, etc. We used to
-            # FORCE output_width=SVG_RENDER_WIDTH (1200) unconditionally,
-            # which blew tiny site icons up into ~half-megabyte 1200x1200
-            # PNGs — slow to fetch and they often failed to load on the
-            # device. Only fall back to an explicit width for SVGs with no
-            # usable size at all (would otherwise render to a couple of px).
-            png_bytes = cairosvg.svg2png(bytestring=raw)
-            try:
-                if max(Image.open(io.BytesIO(png_bytes)).size) < 16:
-                    png_bytes = cairosvg.svg2png(
-                        bytestring=raw, output_width=SVG_RENDER_WIDTH)
-            except Exception:
-                png_bytes = cairosvg.svg2png(
-                    bytestring=raw, output_width=SVG_RENDER_WIDTH)
+            # Inline custom XML entities (else cairosvg 500s — see
+            # _inline_svg_entities) and render at the SVG's own size. We used
+            # to FORCE output_width=1200 unconditionally, which blew tiny
+            # viewBox icons up into ~half-MB 1200x1200 PNGs; now a
+            # viewBox="0 0 100 100" favicon renders ~100px and only size-less
+            # SVGs fall back to the explicit width.
+            png_bytes = _svg_to_png(raw)
         elif fmt == 'webp':
             img = Image.open(io.BytesIO(raw))
             # WebP often comes through with mode RGBA; PNG is happy with
