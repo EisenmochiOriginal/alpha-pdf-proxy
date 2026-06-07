@@ -40,6 +40,7 @@
 import io
 import os
 import re
+import time
 import hashlib
 import subprocess
 import requests
@@ -205,7 +206,7 @@ def pdf2img():
         try:
             r = requests.get(
                 pdf_url, timeout=FETCH_TIMEOUT,
-                headers={'User-Agent': 'Mozilla/5.0 (ALPHA-pdf2img/1.0)'},
+                headers={'User-Agent': BROWSER_UA},
                 allow_redirects=True,
             )
             r.raise_for_status()
@@ -300,7 +301,7 @@ def img2png():
     try:
         r = requests.get(
             img_url, timeout=FETCH_TIMEOUT,
-            headers={'User-Agent': 'Mozilla/5.0 (ALPHA-pdf2img/1.0)'},
+            headers={'User-Agent': BROWSER_UA},
             allow_redirects=True,
         )
         r.raise_for_status()
@@ -378,7 +379,23 @@ def img2png():
 #  the server. See the ESP32-side PAGE_PROXY_URL in pdfviewer.h.
 # ============================================================================
 
-PAGE_UA        = 'Mozilla/5.0 (ALPHA-page/1.0)'
+# v4.8.90: look like a real browser, not a bot. Search engines (Brave
+# especially) serve an empty anti-bot SHELL to datacenter IPs that announce a
+# bot User-Agent — that was the "empty results" problem. A current Chrome UA +
+# the usual navigation headers gets the real server-rendered results page.
+BROWSER_UA      = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                   '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
+BROWSER_HEADERS = {
+    'User-Agent': BROWSER_UA,
+    'Accept': ('text/html,application/xhtml+xml,application/xml;q=0.9,'
+               'image/avif,image/webp,image/apng,*/*;q=0.8'),
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+}
 # Output cap, kept under the ESP32's 64 KB body cap with headroom for the
 # device's own parse overhead.
 PAGE_MAX_BYTES = int(os.environ.get('PAGE_MAX_BYTES', str(56 * 1024)))
@@ -661,28 +678,38 @@ def page():
         return _page_notice('Blocked',
                             'This site is blocked by the mature-content filter.')
 
-    try:
-        r = requests.get(url, timeout=FETCH_TIMEOUT,
-                         headers={'User-Agent': PAGE_UA,
-                                  'Accept-Language': 'en-US,en;q=0.9'},
-                         allow_redirects=True)
-    except requests.exceptions.RequestException as e:
-        return _page_notice('Could not load', str(e)[:200])
-
-    ctype = r.headers.get('Content-Type', '').lower()
-    head = r.text[:256].lstrip().lower()
-    looks_html = ('html' in ctype) or head.startswith(('<!doctype', '<html'))
-    if not looks_html:
-        return _page_notice('Not a web page',
-                            'This link is %s, not HTML.' % (ctype or 'an unknown type'))
-
     img_proxy = request.host_url + 'img2png?url='   # e.g. https://host/img2png?url=
-    try:
-        simplified = simplify_html(r.text, r.url, img_proxy)
-    except Exception as e:
-        return _page_notice('Could not simplify', str(e)[:200])
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=FETCH_TIMEOUT,
+                             headers=BROWSER_HEADERS, allow_redirects=True)
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)[:200]
+            time.sleep(0.4)
+            continue
 
-    return (simplified, 200, {'Content-Type': 'text/html; charset=utf-8'})
+        ctype = r.headers.get('Content-Type', '').lower()
+        head = r.text[:256].lstrip().lower()
+        looks_html = ('html' in ctype) or head.startswith(('<!doctype', '<html'))
+        if not looks_html:
+            return _page_notice('Not a web page',
+                                'This link is %s, not HTML.' % (ctype or 'an unknown type'))
+
+        try:
+            simplified = simplify_html(r.text, r.url, img_proxy)
+        except Exception as e:
+            return _page_notice('Could not simplify', str(e)[:200])
+
+        # Anti-bot shells simplify down to almost nothing. Search engines
+        # sometimes hand a datacenter IP an empty shell instead of results;
+        # retry a couple of times before giving up (a real page is many KB).
+        if len(simplified) > 600 or attempt == 2:
+            return (simplified, 200, {'Content-Type': 'text/html; charset=utf-8'})
+        time.sleep(0.5)
+
+    return _page_notice('Could not load',
+                        last_err or 'the site kept returning an empty page')
 
 
 @app.route('/health')
