@@ -6,3 +6,7 @@ gunicorn==22.0.0
 # (installed in the Dockerfile).
 Pillow==10.4.0
 cairosvg==2.7.1
+# HTML fetch + simplify for the /page endpoint. lxml ships a binary wheel
+# (bundled libxml2), so no extra system packages are needed.
+beautifulsoup4==4.12.3
+lxml==5.2.2

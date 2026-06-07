@@ -39,10 +39,17 @@
 
 import io
 import os
+import re
 import hashlib
 import subprocess
 import requests
+from urllib.parse import urlparse, urljoin, quote, parse_qs, urlencode, urlunparse
 from flask import Flask, request, send_file, abort
+
+# BeautifulSoup + lxml — used by the /page endpoint to fetch, filter and
+# simplify arbitrary web pages down to the tiny tag subset the ESP32's
+# on-device HTML parser renders, so the device "just renders what's given".
+from bs4 import BeautifulSoup, Comment
 
 # Pillow — used by /img2png to decode WebP / JPG, and by downsize_png() to
 # shrink any oversized output on both endpoints.
@@ -348,6 +355,211 @@ def img2png():
     resp = send_file(cache_png, mimetype='image/png')
     resp.headers['X-Original-Format'] = fmt
     return resp
+
+
+# ============================================================================
+#  /page — fetch + filter + simplify a web page for the ESP32 browser
+# ----------------------------------------------------------------------------
+#  GET /page?url=<URL-encoded page URL>
+#    -> 200 text/html   (simplified HTML the ESP32's parser renders directly)
+#  The ESP32 routes every non-PDF/non-image page through here, so all the
+#  heavy lifting (fetch, mature-content filter, strip scripts/styles/ads,
+#  reduce to a tiny tag subset, rewrite images through /img2png) happens on
+#  the server. See the ESP32-side PAGE_PROXY_URL in pdfviewer.h.
+# ============================================================================
+
+PAGE_UA        = 'Mozilla/5.0 (ALPHA-page/1.0)'
+# Output cap, kept under the ESP32's 64 KB body cap with headroom for the
+# device's own parse overhead.
+PAGE_MAX_BYTES = int(os.environ.get('PAGE_MAX_BYTES', str(56 * 1024)))
+
+# --- mature-content filter: domain blocklist + SafeSearch -------------------
+# Curated exact-domain blocklist (matched on the host or any parent domain).
+BLOCK_HOSTS = {
+    'pornhub.com', 'xvideos.com', 'xnxx.com', 'redtube.com', 'youporn.com',
+    'xhamster.com', 'spankbang.com', 'youjizz.com', 'tube8.com', 'onlyfans.com',
+    'chaturbate.com', 'livejasmin.com', 'brazzers.com', 'nhentai.net',
+    'rule34.xxx', 'e-hentai.org', 'hanime.tv', 'fapello.com',
+}
+# Substring heuristic on the hostname for the long tail of unlisted sites.
+BLOCK_SUBSTR = re.compile(
+    r'(porn|xxx|xvideo|xnxx|xhamster|redtube|youporn|hentai|nsfw|escort|'
+    r'camgirl|sexcam|fuck|milf|brazzers|onlyfans|rule34)', re.I)
+
+# Force SafeSearch on the major engines (host-substring -> (param, value)).
+SEARCH_SAFE = {
+    'google.':     ('safe', 'active'),
+    'bing.':       ('adlt', 'strict'),
+    'duckduckgo.': ('kp',   '1'),       # 1 = strict
+    'yandex.':     ('family', 'yes'),
+}
+
+
+def is_blocked_host(host: str) -> bool:
+    h = host.lower().split(':')[0]
+    if h.startswith('www.'):
+        h = h[4:]
+    for b in BLOCK_HOSTS:
+        if h == b or h.endswith('.' + b):
+            return True
+    return bool(BLOCK_SUBSTR.search(h))
+
+
+def enforce_safesearch(url: str) -> str:
+    """Rewrite search-engine URLs to force SafeSearch on."""
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower()
+        for key, (param, val) in SEARCH_SAFE.items():
+            if key in host:
+                q = {k: v[-1] for k, v in parse_qs(p.query).items()}
+                q[param] = val
+                return urlunparse(p._replace(query=urlencode(q)))
+    except Exception:
+        pass
+    return url
+
+
+# --- HTML simplification ----------------------------------------------------
+# Whole subtrees to delete (tag + everything inside).
+_DROP_TREES = [
+    'script', 'style', 'noscript', 'head', 'svg', 'iframe', 'form', 'input',
+    'button', 'select', 'textarea', 'nav', 'aside', 'footer',
+    'video', 'audio', 'canvas', 'object', 'embed',
+    'link', 'meta', 'base', 'template', 'dialog',
+]
+# NOTE: <header>, <figure>, <figcaption> are deliberately NOT dropped — an
+# article's <header> can hold its <h1>, and a <figure> wraps a content <img>.
+# They're unwrapped (content kept, tag dropped) by the main pass instead.
+# Tags the ESP32 parser renders specially — keep these (cleaned). Anything
+# else that survives is UNWRAPPED (its text kept, the tag dropped) so the
+# payload stays lean and the device parser isn't fed tags it ignores.
+_KEEP_TAGS = {
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'br', 'hr', 'a', 'ul',
+    'ol', 'li', 'blockquote', 'img', 'span', 'b', 'strong', 'i', 'em',
+    'table', 'tr', 'td', 'th', 'body', 'html',
+}
+# class / id substrings that mark non-content chrome (ads, nav, cookie bars).
+_JUNK_CLASS = re.compile(
+    r'(?:^|[\s_-])(?:ad|ads|advert|sponsor|banner|promo|msg|about-ads|ddg|'
+    r'result[-_]url|cookie|consent|newsletter|popup|modal|sidebar|menu|'
+    r'share|social|comment|related|recommend|footer|header|nav)\b', re.I)
+
+
+def _classes_str(tag):
+    cls = tag.get('class', [])
+    if isinstance(cls, list):
+        cls = ' '.join(cls)
+    return (cls or '') + ' ' + (tag.get('id', '') or '')
+
+
+def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
+    soup = BeautifulSoup(html, 'lxml')
+
+    title = ''
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    for t in soup.find_all(_DROP_TREES):
+        t.decompose()
+    for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        c.extract()
+    # Drop ad / nav-ish blocks by class/id substring.
+    for t in soup.find_all(True):
+        if _JUNK_CLASS.search(_classes_str(t)):
+            t.decompose()
+
+    body = soup.body or soup
+
+    # Clean attributes, rewrite links/images, unwrap unknown tags.
+    for t in list(body.find_all(True)):
+        name = (t.name or '').lower()
+        if name == 'a':
+            href = t.get('href')
+            t.attrs = {}
+            if href and not href.startswith(('javascript:', '#', 'mailto:')):
+                t['href'] = urljoin(base_url, href)
+        elif name == 'img':
+            src = t.get('src') or t.get('data-src') or t.get('data-original')
+            alt = (t.get('alt') or '').strip()
+            t.attrs = {}
+            if src and not src.startswith('data:'):
+                absu = urljoin(base_url, src)
+                # Route EVERY image through /img2png so the ESP32 always gets
+                # a downsized PNG (incl. WebP/SVG -> PNG).
+                t['src'] = img_proxy + quote(absu, safe='')
+                t['alt'] = alt or 'img'
+            else:
+                t.decompose()
+        elif name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            t.attrs = {k: v for k, v in t.attrs.items() if k == 'id'}
+        elif name == 'span':
+            keep = {}
+            if t.get('id'):
+                keep['id'] = t['id']
+            style = t.get('style', '')
+            if 'color' in style.lower():
+                keep['style'] = style
+            t.attrs = keep
+        elif name in _KEEP_TAGS:
+            t.attrs = {}
+        else:
+            t.unwrap()        # unknown tag -> keep its text, drop the wrapper
+
+    inner = body.decode_contents() if hasattr(body, 'decode_contents') else str(body)
+    head = ('<h1>' + title + '</h1>') if title else ''
+    out = '<html><body>' + head + inner + '</body></html>'
+
+    if len(out) > PAGE_MAX_BYTES:
+        out = out[:PAGE_MAX_BYTES]
+        cut = max(out.rfind('</p>'), out.rfind('</li>'), out.rfind('</div>'))
+        if cut > 0:
+            out = out[:cut + 6]
+        out += '<hr><p>[page truncated]</p></body></html>'
+    return out
+
+
+def _page_notice(title: str, msg: str):
+    body = '<html><body><h1>' + title + '</h1><p>' + msg + '</p></body></html>'
+    return (body, 200, {'Content-Type': 'text/html; charset=utf-8'})
+
+
+@app.route('/page')
+def page():
+    url = request.args.get('url')
+    if not url:
+        abort(400, 'missing ?url=')
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+
+    url = enforce_safesearch(url)
+    host = urlparse(url).netloc
+    if is_blocked_host(host):
+        return _page_notice('Blocked',
+                            'This site is blocked by the mature-content filter.')
+
+    try:
+        r = requests.get(url, timeout=FETCH_TIMEOUT,
+                         headers={'User-Agent': PAGE_UA,
+                                  'Accept-Language': 'en-US,en;q=0.9'},
+                         allow_redirects=True)
+    except requests.exceptions.RequestException as e:
+        return _page_notice('Could not load', str(e)[:200])
+
+    ctype = r.headers.get('Content-Type', '').lower()
+    head = r.text[:256].lstrip().lower()
+    looks_html = ('html' in ctype) or head.startswith(('<!doctype', '<html'))
+    if not looks_html:
+        return _page_notice('Not a web page',
+                            'This link is %s, not HTML.' % (ctype or 'an unknown type'))
+
+    img_proxy = request.host_url + 'img2png?url='   # e.g. https://host/img2png?url=
+    try:
+        simplified = simplify_html(r.text, r.url, img_proxy)
+    except Exception as e:
+        return _page_notice('Could not simplify', str(e)[:200])
+
+    return (simplified, 200, {'Content-Type': 'text/html; charset=utf-8'})
 
 
 @app.route('/health')

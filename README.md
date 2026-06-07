@@ -141,6 +141,15 @@ Environment variables read by `pdf2img.py`:
   `X-Pdf-Pages: M` header with the total page count.
 - `GET /img2png?url=<URL>` — WebP / SVG / JPG / PNG → PNG. Returns image/png
   plus `X-Original-Format: <fmt>` so the ESP32 can log what got converted.
+- `GET /page?url=<URL>` — fetch a web page, filter mature content (domain
+  blocklist + forced SafeSearch on Google/Bing/DDG/Yandex), and **simplify**
+  the HTML down to the tiny tag subset the ESP32's on-device parser renders
+  (headings / p / a / lists / img / blockquote / colour spans). Strips
+  scripts, styles, forms, nav/aside/footer, ads and cookie bars; resolves
+  relative URLs; rewrites every `<img src>` through `/img2png` so the device
+  gets a downsized PNG. Returns `text/html` capped to ~56 KB. The ESP32
+  routes all non-PDF/non-image page loads through this so it "just renders
+  what's given" (see `PAGE_PROXY_URL` in `pdfviewer.h`).
 - `GET /health` — for the tunnel / load balancer to ping. Returns 200 ok.
 
 ## ESP32-side cache
