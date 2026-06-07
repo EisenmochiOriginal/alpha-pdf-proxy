@@ -316,13 +316,23 @@ def img2png():
     # Convert to a PNG byte stream.
     try:
         if fmt == 'svg':
-            # CairoSVG honours the SVG's intrinsic size when neither
-            # output_width nor output_height is given; we pass an
-            # explicit output_width so size-less SVGs (e.g. ones using
-            # viewBox only) get a sensible render rather than 1×1.
-            png_bytes = cairosvg.svg2png(
-                bytestring=raw, output_width=SVG_RENDER_WIDTH,
-            )
+            # Respect the SVG's OWN size (width/height, or the viewBox).
+            # CairoSVG honours the intrinsic size when no output_width is
+            # given — a viewBox="0 0 100 100" favicon renders ~100px, a
+            # viewBox="0 0 140 22" wordmark renders 140x22, etc. We used to
+            # FORCE output_width=SVG_RENDER_WIDTH (1200) unconditionally,
+            # which blew tiny site icons up into ~half-megabyte 1200x1200
+            # PNGs — slow to fetch and they often failed to load on the
+            # device. Only fall back to an explicit width for SVGs with no
+            # usable size at all (would otherwise render to a couple of px).
+            png_bytes = cairosvg.svg2png(bytestring=raw)
+            try:
+                if max(Image.open(io.BytesIO(png_bytes)).size) < 16:
+                    png_bytes = cairosvg.svg2png(
+                        bytestring=raw, output_width=SVG_RENDER_WIDTH)
+            except Exception:
+                png_bytes = cairosvg.svg2png(
+                    bytestring=raw, output_width=SVG_RENDER_WIDTH)
         elif fmt == 'webp':
             img = Image.open(io.BytesIO(raw))
             # WebP often comes through with mode RGBA; PNG is happy with
@@ -518,7 +528,13 @@ def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
                 # Route EVERY image through /img2png so the ESP32 always gets
                 # a downsized PNG (incl. WebP/SVG -> PNG).
                 t['src'] = img_proxy + quote(absu, safe='')
-                t['alt'] = alt or 'img'
+                # Only keep a REAL caption as alt. We used to default to
+                # 'img', but that printed a literal "img" placeholder next to
+                # every single image on the device (the on-device parser shows
+                # the alt text as the image's label). No alt -> no label; the
+                # parser still reserves a box for the picture itself.
+                if alt:
+                    t['alt'] = alt
             else:
                 t.decompose()
         elif name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
