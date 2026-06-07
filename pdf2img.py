@@ -465,6 +465,42 @@ _JUNK_WORDS = frozenset((
 # Never decompose these — they are (or wrap) the whole document / main content.
 _NEVER_KILL = frozenset(('html', 'body', 'main', 'article', '[document]'))
 
+# Search engines print each result's URL as its own line above/below the title
+# (Bing <div class=tptt> "espressif.com" + <cite> "https://en.wikipedia.org ›
+# wiki", DDG result__url anchor, Google <cite>). On a 320px screen that bare
+# URL is redundant noise the user asked to remove — but the SERVER strips the
+# classes that the device used to filter on, so the filtering has to happen
+# here. We drop any element whose ENTIRE visible text is just a URL / domain.
+# A TLD whitelist (or an explicit scheme / path) is required so tech terms
+# ("Node.js"), filenames ("image.png") and abbreviations ("U.S.A") are kept.
+_COMMON_TLDS = frozenset((
+    'com', 'org', 'net', 'edu', 'gov', 'mil', 'int', 'io', 'co', 'ai', 'app',
+    'dev', 'info', 'biz', 'me', 'tv', 'us', 'uk', 'de', 'fr', 'jp', 'ru', 'cn',
+    'in', 'it', 'es', 'nl', 'se', 'no', 'fi', 'dk', 'pl', 'br', 'ca', 'au',
+    'nz', 'ch', 'at', 'be', 'cz', 'gr', 'pt', 'ro', 'hu', 'ua', 'kr', 'tw',
+    'hk', 'sg', 'mx', 'ar', 'cl', 'za', 'ie', 'il', 'tr', 'th', 'vn', 'id',
+    'ph', 'my', 'xyz', 'online', 'site', 'tech', 'store', 'blog', 'news', 'wiki',
+))
+_BARE_URL_RE = re.compile(
+    r'^\s*(?P<scheme>https?://)?(?:www\.)?'
+    r'[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*'        # sub.domain labels
+    r'\.(?P<tld>[a-z]{2,24})'                             # the TLD
+    r'(?P<path>\s*[/›…][\w\s./%›…?=&#:+-]*)?'  # opt path
+    r'\s*$',
+    re.IGNORECASE,
+)
+
+
+def _is_bare_url(s):
+    s = (s or '').strip()
+    if not s or len(s) > 160:
+        return False
+    m = _BARE_URL_RE.match(s)
+    if not m:
+        return False
+    return bool(m.group('scheme')) or bool(m.group('path')) \
+        or (m.group('tld') or '').lower() in _COMMON_TLDS
+
 
 def _is_junk(tag):
     if getattr(tag, 'attrs', None) is None:
@@ -505,6 +541,21 @@ def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
     junk = [t for t in soup.find_all(True) if _is_junk(t)]
     for t in junk:
         if t.parent is not None:        # not already removed via an ancestor
+            t.decompose()
+
+    # Drop the redundant "result URL" lines search engines stack above every
+    # hit. Same collect-then-decompose discipline as the junk pass. The
+    # ^...$ anchoring in _is_bare_url means a container with real prose never
+    # matches — only an element whose WHOLE text is a bare URL is removed, so
+    # result titles (descriptive text) and snippets are untouched.
+    url_noise = []
+    for t in soup.find_all(['a', 'cite', 'div', 'span', 'p']):
+        if getattr(t, 'attrs', None) is None or t.name in _NEVER_KILL:
+            continue
+        if _is_bare_url(t.get_text(' ', strip=True)):
+            url_noise.append(t)
+    for t in url_noise:
+        if t.parent is not None:
             t.decompose()
 
     body = soup.body or soup
