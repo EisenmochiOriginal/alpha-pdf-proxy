@@ -587,9 +587,20 @@ def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
                 t['href'] = urljoin(base_url, href)
         elif name == 'img':
             src = t.get('src') or t.get('data-src') or t.get('data-original')
+            cls = t.get('class') or []
+            if isinstance(cls, str):
+                cls = cls.split()
             alt = _clean_alt(t.get('alt'))   # drop emoji/symbol alts -> no "?"
             t.attrs = {}
-            if src and not src.startswith('data:'):
+            # Drop decorative result favicons. Brave/Google/DDG tag them
+            # class~favicon and stack ~2 per result (≈70 on a results page),
+            # which on a 320px screen with a small on-device image-decode
+            # budget would crowd out the real content images (logos, product
+            # shots, thumbnails) the user actually wants. One fetch per tiny
+            # site icon isn't worth it.
+            if any('favicon' in c.lower() for c in cls):
+                t.decompose()
+            elif src and not src.startswith('data:'):
                 absu = urljoin(base_url, src)
                 # Route EVERY image through /img2png so the ESP32 always gets
                 # a downsized PNG (incl. WebP/SVG -> PNG).
