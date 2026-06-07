@@ -402,6 +402,7 @@ SEARCH_SAFE = {
     'bing.':       ('adlt', 'strict'),
     'duckduckgo.': ('kp',   '1'),       # 1 = strict
     'yandex.':     ('family', 'yes'),
+    'brave.':      ('safesearch', 'strict'),  # device default engine (v4.8.87)
 }
 
 
