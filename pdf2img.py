@@ -503,6 +503,20 @@ def _is_bare_url(s):
         or (m.group('tld') or '').lower() in _COMMON_TLDS
 
 
+def _clean_alt(alt):
+    # The device font only renders ASCII + Latin-1. Emoji / symbols come out
+    # as "?" missing-glyph boxes whenever the image itself doesn't render —
+    # e.g. Brave puts alt="🌐" on every result favicon, so once the per-page
+    # image-decode budget is spent the rest of the favicons all showed up as
+    # "?". Keep only renderable chars; require at least one letter/digit, else
+    # return '' so NO alt (and therefore no label) is emitted.
+    if not alt:
+        return ''
+    out = ''.join(c for c in alt if 0x20 <= ord(c) < 0x7F or 0xA0 <= ord(c) <= 0xFF)
+    out = out.strip()
+    return out if any(c.isalnum() for c in out) else ''
+
+
 def _is_junk(tag):
     if getattr(tag, 'attrs', None) is None:
         return False
@@ -573,7 +587,7 @@ def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
                 t['href'] = urljoin(base_url, href)
         elif name == 'img':
             src = t.get('src') or t.get('data-src') or t.get('data-original')
-            alt = (t.get('alt') or '').strip()
+            alt = _clean_alt(t.get('alt'))   # drop emoji/symbol alts -> no "?"
             t.attrs = {}
             if src and not src.startswith('data:'):
                 absu = urljoin(base_url, src)
