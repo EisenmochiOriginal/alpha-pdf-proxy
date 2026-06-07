@@ -171,6 +171,10 @@ def _detect_image_format(url: str, raw: bytes) -> str:
         return 'png'
     if raw[:3] == b'\xff\xd8\xff':
         return 'jpg'
+    if raw[:4] == b'\x00\x00\x01\x00':       # ICO (type 1) — most favicon.ico
+        return 'ico'
+    if raw[:4] == b'GIF8':                    # GIF87a / GIF89a
+        return 'gif'
     # SVG: skip an optional BOM + whitespace, then look for `<?xml` or `<svg`.
     head = raw[:512].lstrip(b'\xef\xbb\xbf').lstrip()
     if head.startswith(b'<?xml') or head.startswith(b'<svg'):
@@ -180,6 +184,8 @@ def _detect_image_format(url: str, raw: bytes) -> str:
     if lower.endswith('.webp'): return 'webp'
     if lower.endswith('.svg'):  return 'svg'
     if lower.endswith('.png'):  return 'png'
+    if lower.endswith('.ico'):  return 'ico'
+    if lower.endswith('.gif'):  return 'gif'
     if lower.endswith('.jpg') or lower.endswith('.jpeg'): return 'jpg'
     return 'unknown'
 
@@ -385,6 +391,17 @@ def img2png():
             png_bytes = raw                              # passthrough
         elif fmt == 'jpg':
             img = Image.open(io.BytesIO(raw))
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            png_bytes = buf.getvalue()
+        elif fmt in ('ico', 'gif'):
+            # ICO (most favicon.ico) embeds several sizes — Pillow opens the
+            # largest. Animated GIF: take the first frame. Flatten to RGBA so
+            # the PNG save is clean regardless of palette/alpha.
+            img = Image.open(io.BytesIO(raw))
+            if getattr(img, 'is_animated', False):
+                img.seek(0)
+            img = img.convert('RGBA')
             buf = io.BytesIO()
             img.save(buf, format='PNG')
             png_bytes = buf.getvalue()
@@ -594,6 +611,25 @@ def _is_junk(tag):
     return False
 
 
+def _result_domain_for(fav):
+    # Walk up from a favicon <img> to its result block and return the domain of
+    # that result's first external link. Used to rebuild the per-result site
+    # icons that engines fill in with JS (so the server-fetched
+    # <img alt="favicon"> arrives with an empty src).
+    node = fav
+    for _ in range(6):
+        node = node.parent
+        if node is None:
+            return None
+        a = node.find('a', href=re.compile(r'^https?://'))
+        if a and 'startpage.com' not in a['href'].lower():
+            try:
+                return urlparse(a['href']).netloc
+            except Exception:
+                return None
+    return None
+
+
 def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
     soup = BeautifulSoup(html, 'lxml')
 
@@ -629,6 +665,26 @@ def simplify_html(html: str, base_url: str, img_proxy: str) -> str:
     for t in url_noise:
         if t.parent is not None:
             t.decompose()
+
+    # Reconstruct per-result favicons. Engines render the site icon next to
+    # each result with JavaScript, so the server-fetched <img alt="favicon">
+    # has an empty src and would just be dropped (-> no favicons on results).
+    # Point each at the result's OWN domain /favicon.ico — private, no third-
+    # party favicon service — and let the img loop below route it through
+    # /img2png. Dedup consecutive same-domain placeholders (engines emit ~2
+    # per result).
+    last_dom = None
+    for fav in soup.find_all('img', alt='favicon'):
+        if fav.parent is None:
+            continue
+        dom = _result_domain_for(fav)
+        if not dom or dom == last_dom:
+            fav.decompose()
+            continue
+        last_dom = dom
+        for k in list(fav.attrs):
+            del fav[k]
+        fav['src'] = 'https://%s/favicon.ico' % dom
 
     body = soup.body or soup
 
